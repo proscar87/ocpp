@@ -1834,6 +1834,14 @@ class ChargePoint(cp):
             if not is_ended:
                 self._metrics[(global_idx, csess.transaction_id)].value = tx_id
 
+        if is_started and applies_to_current_transaction:
+            # The energy reporting mode is detected from the samples, so a
+            # detection made in an earlier transaction must not decide how
+            # this one is read, starting with this Started's own samples. The
+            # flag is charger-wide: a session running on another connector is
+            # re-detected on its next sample.
+            self._charger_reports_session_energy = False
+
         meter_values: list[dict] = kwargs.get("meter_value", [])
         self._set_meter_values(
             event_type,
