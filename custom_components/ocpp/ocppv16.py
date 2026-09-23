@@ -1531,6 +1531,13 @@ class ChargePoint(cp):
             for sampled_value in bucket.get(om.sampled_value.name, [])
         )
 
+        # Connector 0 is the charge point as a whole: OCPP 1.6 uses it for the
+        # main powermeter, and transactions run on connectors numbered from 1.
+        # Its values may name the transaction they relate to, but it never
+        # holds one. Recording one here put the same id on two connectors, so
+        # the StopTransaction for it could not be attributed and never applied.
+        main_meter: bool = connector_id == 0
+
         # Restore missing per-connector meter_start / active_transaction_id from HA if possible.
         ms_key = (connector_id, csess.meter_start)
         tx_key = (connector_id, csess.transaction_id)
@@ -1554,7 +1561,7 @@ class ChargePoint(cp):
                     value = None
             self._metrics[ms_key].value = value
 
-        if self._metrics[tx_key].value is None:
+        if not main_meter and self._metrics[tx_key].value is None:
             value = self.get_ha_metric(csess.transaction_id, connector_id)
             if value is None:
                 # A first sighting normally restores a transaction after a
@@ -1610,7 +1617,12 @@ class ChargePoint(cp):
         )
 
         # Self-heal after restart: adopt incoming txId if we have none recorded yet
-        if transaction_id and not tx_ended and (recorded_tx == 0 and active_tx == 0):
+        if (
+            not main_meter
+            and transaction_id
+            and not tx_ended
+            and (recorded_tx == 0 and active_tx == 0)
+        ):
             self._metrics[tx_key].value = transaction_id
             self._active_tx[connector_id] = transaction_id
             active_tx = transaction_id
@@ -1633,7 +1645,7 @@ class ChargePoint(cp):
             n_con = int(getattr(self, "num_connectors", 1) or 1)
         except Exception:
             n_con = 1
-        if n_con == 1:
+        if n_con == 1 and not main_meter:
             try:
                 legacy = int(getattr(self, "active_transaction_id", 0) or 0)
             except Exception:
@@ -1643,7 +1655,10 @@ class ChargePoint(cp):
 
         transaction_matches: bool = False
         # Match is also false if no transaction is in progress, i.e. active_tx==transaction_id==0
-        if transaction_id == active_tx and transaction_id != 0:
+        if main_meter:
+            # Values naming a transaction are its samples, wherever it runs.
+            transaction_matches = tx_has_id
+        elif transaction_id == active_tx and transaction_id != 0:
             transaction_matches = True
         elif transaction_id != 0 and tx_ended:
             # The closing values arrive once the transaction has been cleared, but
@@ -1701,7 +1716,8 @@ class ChargePoint(cp):
         # closing values leave the final figure alone. A held connector only
         # gets here once the sample above has settled it as running, so its
         # timer stands still until the charger says something about it.
-        if tx_has_id and transaction_matches and not tx_ended:
+        # Connector 0 has no session of its own to time.
+        if tx_has_id and transaction_matches and not tx_ended and not main_meter:
             started_at = self._ensure_session_start(connector_id, transaction_id)
             self._metrics[session_key].value = max(
                 0, round((time.time() - started_at) / 60)

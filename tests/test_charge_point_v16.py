@@ -2824,6 +2824,174 @@ async def test_on_meter_values_closing_values_after_stop(
             await ws.close()
 
 
+def _main_meter_values(
+    connector_id: int, transaction_id: int | None, wh: int
+) -> call.MeterValues:
+    """Build an energy register sample, optionally naming its transaction."""
+    extra = {} if transaction_id is None else {"transaction_id": transaction_id}
+    return call.MeterValues(
+        connector_id=connector_id,
+        meter_value=[
+            {
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "sampledValue": [
+                    {
+                        "measurand": "Energy.Active.Import.Register",
+                        "context": "Sample.Periodic",
+                        "unit": "Wh",
+                        "value": str(wh),
+                    }
+                ],
+            }
+        ],
+        **extra,
+    )
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize(
+    ("setup_config_entry", "cp_id", "port", "names_transaction"),
+    [
+        (
+            {"port": 9107, "cp_id": "CP_main_meter", "cms": "cms_main_meter"},
+            "CP_main_meter",
+            9107,
+            False,
+        ),
+        (
+            {"port": 9108, "cp_id": "CP_main_meter_tx", "cms": "cms_main_meter_tx"},
+            "CP_main_meter_tx",
+            9108,
+            True,
+        ),
+    ],
+    indirect=["setup_config_entry"],
+)
+async def test_main_meter_values_do_not_block_the_stop(
+    hass, socket_enabled, cp_id, port, setup_config_entry, names_transaction
+):
+    """A connector 0 sample during a session must not make its stop ambiguous.
+
+    OCPP 1.6 uses connector 0 for the main powermeter; transactions run on
+    connectors from 1. Its sample used to record the running transaction on
+    connector 0 too, restored from the transaction sensor or taken from the
+    sample, so the StopTransaction for it matched two connectors, was held as
+    unattributable and never applied.
+    """
+
+    cs: CentralSystem = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        cp = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(cp.start())
+        try:
+            await cp.send_boot_notification()
+            srv = cs.charge_points[cp_id]
+            await wait_ready(srv)
+            tx_entity = f"sensor.{srv.settings.cpid}_transaction_id"
+
+            await cp.send_start_transaction(meter_start=356000)
+            tx_id = cp.active_transactionId
+            await cp.call(_main_meter_values(1, tx_id, 356500))
+            await hass.async_block_till_done()
+            assert hass.states.get(tx_entity).state == str(tx_id)
+
+            await cp.call(
+                _main_meter_values(0, tx_id if names_transaction else None, 356600)
+            )
+            await hass.async_block_till_done()
+            # Remote stop on a single connector charger reads this id.
+            assert srv.active_transaction_id == tx_id
+
+            await cp.call(
+                call.StopTransaction(
+                    meter_stop=357000,
+                    timestamp=datetime.now(tz=UTC).isoformat(),
+                    transaction_id=tx_id,
+                    reason="EVDisconnected",
+                    id_tag="test_cp",
+                )
+            )
+            await hass.async_block_till_done()
+
+            assert srv._pending_stops == []
+            assert srv._tx_indeterminate == set()
+            assert not any(srv._active_tx.values())
+            assert cs.get_metric(cp_id, "Transaction.Id", connector_id=1) == 0
+            assert cs.get_metric(
+                cp_id, "Energy.Session", connector_id=1
+            ) == pytest.approx(1.0, rel=1e-6)
+            assert hass.states.get(tx_entity).state == "0"
+
+            # The next session is reported under its own id.
+            await cp.send_start_transaction(meter_start=357000)
+            await hass.async_block_till_done()
+            assert hass.states.get(tx_entity).state == str(cp.active_transactionId)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9109, "cp_id": "CP_main_meter_sess", "cms": "cms_main_meter_sess"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_main_meter_sess"])
+@pytest.mark.parametrize("port", [9109])
+async def test_main_meter_values_naming_a_transaction_count_as_its_samples(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """A connector 0 sample that names the running transaction is one of its samples.
+
+    On a charger that reports session energy in the energy register, treating
+    it as outside the transaction would write the session figure over the
+    lifetime register.
+    """
+
+    cs: CentralSystem = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        cp = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(cp.start())
+        try:
+            await cp.send_boot_notification()
+            srv = cs.charge_points[cp_id]
+            await wait_ready(srv)
+
+            # meter_start of 0 marks a charger that reports session energy.
+            await cp.send_start_transaction(meter_start=0)
+            tx_id = cp.active_transactionId
+            await cp.call(_main_meter_values(1, tx_id, 500))
+            lifetime = cs.get_metric(
+                cp_id, "Energy.Active.Import.Register", connector_id=1
+            )
+
+            await cp.call(_main_meter_values(0, tx_id, 700))
+            await hass.async_block_till_done()
+
+            assert cs.get_metric(
+                cp_id, "Energy.Session", connector_id=1
+            ) == pytest.approx(0.7, rel=1e-6)
+            assert (
+                cs.get_metric(cp_id, "Energy.Active.Import.Register", connector_id=1)
+                == lifetime
+            )
+            # Nor does connector 0 get a session of its own to time.
+            assert not srv._active_tx.get(0)
+            assert 0 not in srv._tx_started_at
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize(
     "setup_config_entry",
